@@ -11,7 +11,7 @@ import taichi as ti
 from .cli import build_parser
 from .pick import lookat_to_grid, sample_cell
 from .session import create_session
-from .streamlines import seeds_near_torch, trace_streamlines
+from .streamlines import seeds_in_liquid_near_torch, trace_streamlines
 
 MODE_TEMP = 0
 MODE_HAZ = 1
@@ -28,12 +28,93 @@ FLOW_NAMES = ("off", "arrows", "streamlines")
 PROBE_HISTORY_LEN = 48
 
 
+def _track_camera_zup(
+    camera: ti.ui.Camera,
+    window: ti.ui.Window,
+    *,
+    movement_speed: float = 2.0,
+    yaw_speed: float = 2.0,
+    pitch_speed: float = 2.0,
+    hold_key=ti.ui.LMB,
+) -> None:
+    """WASD/QE + LMB look for Z-up scenes.
+
+    Taichi's ``Camera.track_user_inputs`` uses Y-up euler angles
+    (``utils.euler_to_vec``). This viewer sets ``camera.up(0,0,1)``, so the
+    stock helper maps drag-up→left and drag-left→up. Reimplement with Z-up
+    yaw (about Z) / pitch (elevation), but keep Taichi's FPS semantics:
+    translate along the view direction and always ``lookat = position + front``.
+    """
+    import time
+    from math import asin, atan2, cos, pi, sin
+
+    from taichi.lang.matrix import Vector
+
+    if not hasattr(camera, "_waam_last_time"):
+        camera._waam_last_time = None
+        camera._waam_last_mouse = (None, None)
+
+    front = (camera.curr_lookat - camera.curr_position).normalized()
+    up = camera.curr_up
+    left = up.cross(front)
+
+    now = time.perf_counter_ns()
+    if camera._waam_last_time is None:
+        camera._waam_last_time = now
+    dt = (now - camera._waam_last_time) * 1e-9
+    camera._waam_last_time = now
+    # Guard against a huge first-frame jump after pause / focus change.
+    dt = min(max(dt, 0.0), 0.05)
+    speed = movement_speed * dt * 60.0
+
+    delta = Vector([0.0, 0.0, 0.0])
+    if window.is_pressed("w"):
+        delta += front * speed
+    if window.is_pressed("s"):
+        delta -= front * speed
+    if window.is_pressed("a"):
+        delta += left * speed
+    if window.is_pressed("d"):
+        delta -= left * speed
+    if window.is_pressed("e"):
+        delta += up * speed
+    if window.is_pressed("q"):
+        delta -= up * speed
+    if delta.norm() > 0.0:
+        camera.position(*(camera.curr_position + delta))
+
+    mx, my = window.get_cursor_pos()
+    lx, ly = camera._waam_last_mouse
+    holding = hold_key is None or window.is_pressed(hold_key)
+    if holding:
+        if lx is None or ly is None:
+            pass  # arm on next frame to avoid a jump
+        else:
+            dx = mx - lx
+            dy = my - ly
+            fz = float(np.clip(float(front[2]), -0.999, 0.999))
+            pitch = asin(fz)
+            yaw = atan2(float(front[0]), float(front[1]))
+            yaw += dx * yaw_speed * dt * 60.0
+            pitch += dy * pitch_speed * dt * 60.0
+            pitch = float(np.clip(pitch, -pi / 2 * 0.99, pi / 2 * 0.99))
+            front = Vector([
+                sin(yaw) * cos(pitch),
+                cos(yaw) * cos(pitch),
+                sin(pitch),
+            ])
+    # Always keep lookat = position + front (FPS), even when only WASD moves.
+    camera.lookat(*(camera.curr_position + front))
+    camera._waam_last_mouse = (mx, my) if holding else (None, None)
+
+
 def _ensure_output_dir(path: str | None) -> pathlib.Path:
+    from ..paths import PROJECT_ROOT, resolve_output_path
+
     if path is None:
-        from ..paths import PROJECT_ROOT
         out = PROJECT_ROOT / "viewer_output"
     else:
-        out = pathlib.Path(path)
+        out = resolve_output_path(path)
     out.mkdir(parents=True, exist_ok=True)
     return out
 
@@ -42,13 +123,19 @@ def _sparkline(values: deque[float], t_min: float, t_max: float, width: int = 24
     if not values:
         return "(no data yet)"
     blocks = " ▁▂▃▄▅▆▇█"
-    span = max(t_max - t_min, 1.0)
+    # NaN after a physics blow-up used to crash the viewer here.
+    if not np.isfinite(t_min) or not np.isfinite(t_max):
+        return "(T invalid / NaN)"
+    span = max(float(t_max) - float(t_min), 1.0)
     if len(values) >= width:
         sample = list(values)[-width:]
     else:
         sample = list(values)
     chars = []
     for v in sample:
+        if not np.isfinite(v):
+            chars.append("?")
+            continue
         idx = int(max(0, min(len(blocks) - 1, round((v - t_min) / span * (len(blocks) - 1)))))
         chars.append(blocks[idx])
     return "".join(chars)
@@ -69,7 +156,7 @@ def _flow_filter(filter_mode: int, flow_mode: int, liquid_only: int) -> int:
 
 
 def run(argv: list[str] | None = None) -> None:
-    from waam_twin.platform import init_taichi
+    from waam_twin.runtime import init_taichi
 
     args = build_parser().parse_args(argv)
     init_taichi()
@@ -89,6 +176,7 @@ def run(argv: list[str] | None = None) -> None:
         extract_melt_pool,
         extract_surface_points,
         extract_torch_marker,
+        extract_arc_attach_marker,
         extract_tracers,
         extract_velocity,
         extract_vorticity,
@@ -124,8 +212,8 @@ def run(argv: list[str] | None = None) -> None:
     tracer_pos = ti.Vector.field(3, dtype=ti.f32, shape=g.max_tracers)
     tracer_col = ti.Vector.field(3, dtype=ti.f32, shape=g.max_tracers)
 
-    sl_vert = ti.Vector.field(3, dtype=ti.f32, shape=8192)
-    sl_col = ti.Vector.field(3, dtype=ti.f32, shape=8192)
+    sl_vert = ti.Vector.field(3, dtype=ti.f32, shape=32768)
+    sl_col = ti.Vector.field(3, dtype=ti.f32, shape=32768)
 
     window = ti.ui.Window("WAAM Digital Twin", (1280, 720), vsync=True)
     camera = ti.ui.Camera()
@@ -133,9 +221,11 @@ def run(argv: list[str] | None = None) -> None:
     cx = g.nx * dx_mm / 2.0 + session.offset_x_mm()
     cy = g.ny * dx_mm / 2.0
     cz = g.nz * dx_mm / 2.0
-
-    camera.position(cx * 0.5, -35.0, cz * 2.0)
-    camera.lookat(cx, cy, cz * 0.3)
+    # Aim at the plate top (arc attachment), not mid-domain Z — otherwise a
+    # deep melt pool on a Clip-Y cut looks "centred" in the plate thickness.
+    plate_top_mm = float(twin.nz_solid) * dx_mm
+    camera.position(cx * 0.55, -max(45.0, cy * 0.9), plate_top_mm + 35.0)
+    camera.lookat(cx, cy, plate_top_mm)
     camera.up(0.0, 0.0, 1.0)
 
     paused = args.paused
@@ -145,11 +235,13 @@ def run(argv: list[str] | None = None) -> None:
     show_tracers = True
     show_torch = True
     show_surface_mesh = False
+    clip_x = False
     clip_y = False
     clip_z = False
     filter_mode = FILTER_LIQUID if args.liquid_only else FILTER_ALL
     use_phi = 1 if twin.enable_vof else 0
     dump_idx = 0
+    pending_screenshot = False
     streamline_cache: list[np.ndarray] = []
     streamline_frame = -999
     num_flow_arrows = 0
@@ -168,9 +260,18 @@ def run(argv: list[str] | None = None) -> None:
     _print_controls()
 
     print(f"\n  Job     : {session.job_label}")
-    print(f"  Grid    : {g.nx}×{g.ny}×{g.nz}  dx={dx_mm:.3f} mm")
-    print(f"  VOF     : {twin.enable_vof}  |  Path: {session.uses_path}")
-    print(f"  Travel  : {session.torch_spd_m_s * 1000:.2f} mm/s")
+    print(f"  Hardware: {getattr(twin, 'preset_name', '?')}  "
+          f"(coarsens dx for max_cells/VRAM — not FPS; keeps plate size)")
+    print(f"  Domain  : {g.nx * dx_mm:.1f}×{g.ny * dx_mm:.1f}×{g.nz * dx_mm:.1f} mm  "
+          f"grid {g.nx}×{g.ny}×{g.nz}  dx={dx_mm:.3f} mm")
+    ps = getattr(twin, "plate_size_mm", None)
+    if ps:
+        print(f"  Plate   : {ps[0]:.0f}×{ps[1]:.0f}×{float(twin.plate_thickness_mm or 0):.1f} mm  "
+              f"(square from top if L=W; side view shows L×thickness)")
+    else:
+        print(f"  Plate   : full domain XY × {float(twin.nz_solid) * dx_mm:.1f} mm thick")
+    print(f"  Physics : tier={getattr(twin, 'physics_tier', '?')}  VOF={twin.enable_vof}")
+    print(f"  Path    : {session.uses_path}  travel={session.torch_spd_m_s * 1000:.2f} mm/s")
     print(f"  Particles: radius={particle_scale:.2f}×dx  (--particle-scale)")
     print(f"  Output  : {out_dir.resolve()}\n")
 
@@ -201,10 +302,12 @@ def run(argv: list[str] | None = None) -> None:
             elif e.key in ("n", "N"):
                 show_surface_mesh = not show_surface_mesh
                 print(f"[viewer] Surface view → {'φ shell (T-colored)' if show_surface_mesh else 'particles'}")
-            elif e.key in ("c", "C"):
+            elif e.key in ("y", "Y"):
                 clip_y = not clip_y
             elif e.key in ("z", "Z"):
                 clip_z = not clip_z
+            elif e.key in ("x", "X"):
+                clip_x = not clip_x
             elif e.key in ("t", "T"):
                 show_tracers = not show_tracers
             elif e.key in ("o", "O"):
@@ -217,29 +320,19 @@ def run(argv: list[str] | None = None) -> None:
                 steps_per_frame = min(500, steps_per_frame + 5)
             elif e.key == "-" or e.key == "_":
                 steps_per_frame = max(1, steps_per_frame - 5)
-            elif e.key in ("s", "S"):
-                path = out_dir / f"frame_{dump_idx:05d}.png"
-                try:
-                    window.save_image(str(path))
-                    print(f"[viewer] Screenshot → {path}")
-                    dump_idx += 1
-                except Exception as exc:
-                    print(f"[viewer] Screenshot failed: {exc}")
+            elif e.key in ("p", "P"):
+                # Defer to end-of-frame: Taichi requires save_image after the
+                # scene is drawn but before window.show(). Calling it from the
+                # event loop (pre-draw) captures a cleared buffer and can leave
+                # subsequent frames black.
+                pending_screenshot = True
             elif e.key in ("g", "G"):
-                tag = f"step_{twin._step_n:06d}"
-                bundle_dir = out_dir / f"bundle_{tag}"
                 try:
-                    twin.export_research_bundle(
-                        bundle_dir,
-                        tag=tag,
-                        tiers=(0, 1, 2, 3),
-                        include_surface=True,
-                        include_tracers=True,
-                    )
+                    session.export_g_bundle(out_dir)
                 except Exception as exc:
                     print(f"[viewer] Bundle export failed: {exc}")
-            elif e.key in ("p", "P"):
-                tx, ty, tz = session.torch_mm()
+            elif e.key in ("u", "U"):
+                tx, ty, tz = session.torch_surface_mm()
                 if twin.probe_recorder is None:
                     from waam_twin.export.probes import ProbeRecorder
                     twin.probe_recorder = ProbeRecorder()
@@ -247,7 +340,7 @@ def run(argv: list[str] | None = None) -> None:
                 ti_c = int(np.clip((tx - session.offset_x_mm()) / dx_mm, 0, g2.nx - 1))
                 tj_c = int(np.clip(ty / dx_mm, 0, g2.ny - 1))
                 tk_c = int(np.clip(tz / dx_mm, 0, g2.nz - 1))
-                twin.probe_recorder.add_grid(ti_c, tj_c, tk_c, f"torch_{len(twin.probe_recorder.probes)}")
+                twin.probe_recorder.add_grid(ti_c, tj_c, tk_c, twin, f"torch_{len(twin.probe_recorder.probes)}")
                 print(f"[viewer] Probe added at ({ti_c},{tj_c},{tk_c})")
             elif e.key in ("i", "I"):
                 la = camera.curr_lookat
@@ -258,7 +351,7 @@ def run(argv: list[str] | None = None) -> None:
                 if twin.probe_recorder is None:
                     from waam_twin.export.probes import ProbeRecorder
                     twin.probe_recorder = ProbeRecorder()
-                twin.probe_recorder.add_grid(pi, pj, pk, pick_label)
+                twin.probe_recorder.add_grid(pi, pj, pk, twin, pick_label)
                 vals = sample_cell(twin, pi, pj, pk)
                 print(
                     f"[viewer] Pick ({pi},{pj},{pk})  T={vals['T_C']:.0f}°C  "
@@ -269,7 +362,10 @@ def run(argv: list[str] | None = None) -> None:
 
         if not paused:
             session.advance_physics(steps_per_frame, is_welding=True)
+            session.maybe_auto_export_on_path_end(out_dir)
 
+        # Export/diagnostic buffers are allocated lazily (not on minimal grids).
+        g.ensure_export_buffers()
         kernels.compute_vorticity_magnitude(
             g.ux, g.uy, g.uz, g.flags, g.vorticity_mag,
             g.dx, g.dt, g.FLAG_GAS, g.nx, g.ny, g.nz,
@@ -277,12 +373,13 @@ def run(argv: list[str] | None = None) -> None:
 
         canvas = window.get_canvas()
         scene = window.get_scene()
-        # Invert yaw only; pitch uses Taichi default (drag up → look up).
-        camera.track_user_inputs(
+        # Z-up orbit (Taichi stock track_user_inputs is Y-up and swaps axes here).
+        _track_camera_zup(
+            camera,
             window,
             movement_speed=2.0,
             hold_key=ti.ui.LMB,
-            yaw_speed=-2.0,
+            yaw_speed=2.0,
             pitch_speed=2.0,
         )
         scene.set_camera(camera)
@@ -290,6 +387,7 @@ def run(argv: list[str] | None = None) -> None:
         scene.point_light(pos=(cx, cy - 30.0, cz + 40.0), color=(1.0, 0.95, 0.85))
 
         offset_x_mm = session.offset_x_mm()
+        clip_x_i = 1 if clip_x else 0
         clip_y_i = 1 if clip_y else 0
         clip_z_i = 1 if clip_z else 0
 
@@ -301,18 +399,18 @@ def run(argv: list[str] | None = None) -> None:
                 dx_mm, offset_x_mm,
                 twin.mat.T_solidus, twin.mat.T_liquidus,
                 g.FLAG_GAS, max_cells,
-                clip_y_i, clip_z_i, g.ny, g.nz,
+                clip_x_i, clip_y_i, clip_z_i, g.nx, g.ny, g.nz,
             )
         elif render_mode == MODE_TEMP:
             extract_melt_pool(
                 g.f_l, g.T, g.T_max, g.phi, g.flags,
                 render_pos, render_col, count_field,
                 dx_mm, offset_x_mm,
-                twin.mat.T_solidus, twin.mat.T_liquidus,
+                float(twin.T_amb), twin.mat.T_solidus, twin.mat.T_liquidus,
                 twin.nz_solid,
                 g.FLAG_GAS, g.FLAG_FLUID, g.FLAG_SOLID,
                 filter_mode, use_phi, max_cells,
-                clip_y_i, clip_z_i, g.ny, g.nz,
+                clip_x_i, clip_y_i, clip_z_i, g.nx, g.ny, g.nz,
             )
         elif render_mode == MODE_HAZ:
             extract_haz(
@@ -321,7 +419,7 @@ def run(argv: list[str] | None = None) -> None:
                 dx_mm, offset_x_mm,
                 twin.mat.T_solidus, g.FLAG_GAS, g.FLAG_SOLID,
                 filter_mode, use_phi, max_cells,
-                clip_y_i, clip_z_i, g.ny, g.nz,
+                clip_x_i, clip_y_i, clip_z_i, g.nx, g.ny, g.nz,
             )
         elif render_mode == MODE_VEL:
             extract_velocity(
@@ -330,16 +428,32 @@ def run(argv: list[str] | None = None) -> None:
                 dx_mm, offset_x_mm, g.dx, g.dt, g.u_ref_phys,
                 g.FLAG_GAS, g.FLAG_FLUID, g.FLAG_SOLID,
                 filter_mode, use_phi, max_cells,
-                clip_y_i, clip_z_i, g.ny, g.nz,
+                clip_x_i, clip_y_i, clip_z_i, g.nx, g.ny, g.nz,
             )
         elif render_mode == MODE_VORT:
+            # Adaptive scale: fixed 5000/s made real pool vorticity (~10–300/s) invisible.
+            vort_np = g.vorticity_mag.to_numpy()
+            fl_np = g.f_l.to_numpy()
+            mask = fl_np > 0.12
+            if np.any(mask):
+                vals = vort_np[mask]
+                vort_ref = float(np.percentile(vals, 95))
+                vort_floor = float(np.percentile(vals, 40))
+            else:
+                vmax = float(np.max(vort_np)) if vort_np.size else 0.0
+                vort_ref = max(vmax, 50.0)
+                vort_floor = 0.05 * vort_ref
+            vort_ref = max(vort_ref, 5.0)
+            vort_floor = max(min(vort_floor, 0.35 * vort_ref), 0.5)
+            # Prefer liquid so cold solid does not wash out the field.
+            vort_filter = FILTER_LIQUID if filter_mode == FILTER_ALL else filter_mode
             extract_vorticity(
                 g.vorticity_mag, g.f_l, g.phi, g.flags,
                 render_pos, render_col, count_field,
-                dx_mm, offset_x_mm, 5000.0,
+                dx_mm, offset_x_mm, vort_ref, vort_floor,
                 g.FLAG_GAS, g.FLAG_FLUID, g.FLAG_SOLID,
-                filter_mode, use_phi, max_cells,
-                clip_y_i, clip_z_i, g.ny, g.nz,
+                vort_filter, use_phi, max_cells,
+                clip_x_i, clip_y_i, clip_z_i, g.nx, g.ny, g.nz,
             )
         else:
             extract_body_force(
@@ -349,13 +463,20 @@ def run(argv: list[str] | None = None) -> None:
                 dx_mm, offset_x_mm, 0.01,
                 g.FLAG_GAS, g.FLAG_FLUID, g.FLAG_SOLID,
                 filter_mode, use_phi, max_cells,
-                clip_y_i, clip_z_i, g.ny, g.nz,
+                clip_x_i, clip_y_i, clip_z_i, g.nx, g.ny, g.nz,
             )
 
         num_cells = count_field[None]
 
         if show_torch:
-            tx, ty, tz = session.torch_mm()
+            # Cyan = arc attachment / heat inject (plate surface under torch).
+            # Yellow = contact tip (surface + CTWD). Heat is at cyan, not yellow.
+            sx, sy, sz = session.torch_surface_mm()
+            extract_arc_attach_marker(
+                render_pos, render_col, count_field,
+                sx, sy, sz, max_cells + 1,
+            )
+            tx, ty, tz = session.torch_marker_mm()
             extract_torch_marker(
                 render_pos, render_col, count_field,
                 tx, ty, tz, max_cells + 1,
@@ -382,7 +503,7 @@ def run(argv: list[str] | None = None) -> None:
 
         num_flow_arrows = 0
         if flow_mode == FLOW_ARROWS:
-            tx, ty, tz = session.torch_mm()
+            tx, ty, tz = session.torch_surface_mm()
             ti_c = int(np.clip((tx - offset_x_mm) / dx_mm, 0, g.nx - 1))
             tj_c = int(np.clip(ty / dx_mm, 0, g.ny - 1))
             tk_c = int(np.clip(tz / dx_mm, 0, g.nz - 1))
@@ -406,7 +527,7 @@ def run(argv: list[str] | None = None) -> None:
                     1,
                     g.FLAG_GAS, g.FLAG_SOLID,
                     FILTER_LIQUID, use_phi, max_arrows,
-                    0, 0, g.ny, g.nz,
+                    0, 0, 0, g.nx, g.ny, g.nz,
                 )
                 num_flow_arrows = count_field[None]
             if num_flow_arrows > 0:
@@ -418,7 +539,7 @@ def run(argv: list[str] | None = None) -> None:
                 )
 
         if render_mode == MODE_FORCE and flow_mode == FLOW_OFF:
-            tx, ty, tz = session.torch_mm()
+            tx, ty, tz = session.torch_surface_mm()
             ti_c = int(np.clip((tx - offset_x_mm) / dx_mm, 0, g.nx - 1))
             tj_c = int(np.clip(ty / dx_mm, 0, g.ny - 1))
             tk_c = int(np.clip(tz / dx_mm, 0, g.nz - 1))
@@ -440,46 +561,69 @@ def run(argv: list[str] | None = None) -> None:
                     vertex_count=n_force * 2,
                 )
 
-        if flow_mode == FLOW_STREAMLINES and twin._step_n - streamline_frame > 4:
+        if flow_mode == FLOW_STREAMLINES and twin._step_n - streamline_frame > 10:
             streamline_frame = twin._step_n
-            tx, ty, tz = session.torch_mm()
+            tx, ty, tz = session.torch_surface_mm()
             ti_c = int(np.clip((tx - offset_x_mm) / dx_mm, 0, g.nx - 1))
             tj_c = int(np.clip(ty / dx_mm, 0, g.ny - 1))
             tk_c = int(np.clip(tz / dx_mm, 0, g.nz - 1))
-            seeds = seeds_near_torch(g.nx, g.ny, g.nz, ti_c, tj_c, tk_c, 16)
+            ux_np = g.ux.to_numpy()
+            uy_np = g.uy.to_numpy()
+            uz_np = g.uz.to_numpy()
+            fl_np = g.f_l.to_numpy()
+            flags_np = g.flags.to_numpy()
+            seeds = seeds_in_liquid_near_torch(
+                ux_np, uy_np, uz_np, fl_np, flags_np,
+                ti_c, tj_c, tk_c, g.FLAG_GAS, n=36, search_r=14,
+            )
             streamline_cache = trace_streamlines(
-                g.ux.to_numpy(), g.uy.to_numpy(), g.uz.to_numpy(),
-                seeds, n_steps=45, step_cells=0.7,
+                ux_np, uy_np, uz_np, seeds,
+                n_steps=160, step_cells=0.4,
+                f_l=fl_np, flags=flags_np, flag_gas=g.FLAG_GAS,
+                fl_cut=0.04, bidirectional=True,
             )
 
         if flow_mode == FLOW_STREAMLINES and streamline_cache:
-            vert_list: list[list[float]] = []
+            # GGUI scene.lines reads GPU buffers — host index writes to
+            # ti.Vector.field often do not upload. Build numpy then from_numpy.
+            max_verts = sl_vert.shape[0]
+            vert_np = np.zeros((max_verts, 3), dtype=np.float32)
+            col_np = np.zeros((max_verts, 3), dtype=np.float32)
             base = 0
             n_seg = 0
             for line in streamline_cache:
-                for k in range(len(line) - 1):
-                    if base + 1 >= sl_vert.shape[0]:
+                n_pts = len(line)
+                if n_pts < 2:
+                    continue
+                for k in range(n_pts - 1):
+                    if base + 1 >= max_verts:
                         break
-                    p0, p1 = line[k], line[k + 1]
-                    sl_vert[base] = [
+                    p0 = line[k]
+                    p1 = line[k + 1]
+                    vert_np[base] = [
                         float(p0[0]) * dx_mm + offset_x_mm,
                         float(p0[1]) * dx_mm,
                         float(p0[2]) * dx_mm,
                     ]
-                    sl_vert[base + 1] = [
+                    vert_np[base + 1] = [
                         float(p1[0]) * dx_mm + offset_x_mm,
                         float(p1[1]) * dx_mm,
                         float(p1[2]) * dx_mm,
                     ]
-                    sl_col[base] = [0.15, 0.95, 1.0]
-                    sl_col[base + 1] = [0.15, 0.95, 1.0]
+                    # Speed-tint along the polyline (head brighter)
+                    t = k / max(n_pts - 2, 1)
+                    c = (0.1 + 0.2 * t, 0.75 + 0.2 * t, 1.0)
+                    col_np[base] = c
+                    col_np[base + 1] = c
                     base += 2
                     n_seg += 1
             if n_seg > 0:
+                sl_vert.from_numpy(vert_np)
+                sl_col.from_numpy(col_np)
                 scene.lines(
                     sl_vert,
                     per_vertex_color=sl_col,
-                    width=3.0,
+                    width=4.0,
                     vertex_count=n_seg * 2,
                 )
 
@@ -488,7 +632,7 @@ def run(argv: list[str] | None = None) -> None:
             g.porosity_pos, g.porosity_active,
             tracer_pos, tracer_col, count_field,
             g.max_tracers, g.max_tracers,
-            offset_x_mm, clip_y_i, clip_z_i, g.dx, g.ny, g.nz,
+            offset_x_mm, clip_x_i, clip_y_i, clip_z_i, g.dx, g.nx, g.ny, g.nz,
         )
         num_tracers = count_field[None]
         if show_tracers and num_tracers > 0:
@@ -509,23 +653,40 @@ def run(argv: list[str] | None = None) -> None:
             FILTER_SOLID: "solid (HAZ)",
         }
         status_str = "PAUSED" if paused else f"LIVE  {steps_per_frame} st/frame"
+        if session.path_complete():
+            status_str = ("PAUSED" if paused else "LIVE") + "  ARC OFF (path end)"
 
         # Probe T(t) for sparkline (first probe or pick cell)
         spark_name = ""
         if twin.probe_recorder and twin.probe_recorder.probes:
             p0 = twin.probe_recorder.probes[0]
-            vals = sample_cell(twin, p0.i, p0.j, p0.k)
-            probe_t_history.append(vals["T_K"])
-            spark_name = p0.name
-            probe_spark_min = min(probe_spark_min, vals["T_K"] - 50.0)
-            probe_spark_max = max(probe_spark_max, vals["T_K"] + 50.0)
+            idx = p0.resolve(twin)
+            if idx is not None:
+                vals = sample_cell(twin, *idx)
+                tk = vals["T_K"]
+                if np.isfinite(tk):
+                    probe_t_history.append(tk)
+                    probe_spark_min = min(probe_spark_min, tk - 50.0)
+                    probe_spark_max = max(probe_spark_max, tk + 50.0)
+                spark_name = p0.name
         elif pick_cell is not None:
             vals = sample_cell(twin, *pick_cell)
-            probe_t_history.append(vals["T_K"])
+            tk = vals["T_K"]
+            if np.isfinite(tk):
+                probe_t_history.append(tk)
             spark_name = pick_label or "pick"
 
         window.GUI.begin("WAAM Twin", 0.01, 0.01, 0.42, 0.46)
         window.GUI.text(f"Job    : {session.job_label}")
+        _ps = getattr(twin, "plate_size_mm", None)
+        if _ps:
+            window.GUI.text(
+                f"Plate  : {_ps[0]:.0f}×{_ps[1]:.0f}×"
+                f"{float(twin.plate_thickness_mm or twin.nz_solid * dx_mm):.1f} mm  "
+                f"dx={dx_mm:.3f}"
+            )
+        else:
+            window.GUI.text(f"Plate  : full XY  dx={dx_mm:.3f} mm")
         window.GUI.text(f"Status : {status_str}")
         window.GUI.text(f"View   : {MODE_NAMES[render_mode]}")
         flow_hint = FLOW_NAMES[flow_mode]
@@ -536,9 +697,28 @@ def run(argv: list[str] | None = None) -> None:
             window.GUI.text("  (no flow arrows at torch — try B=liquid, Z=off)")
         window.GUI.text(f"Filter : {filter_labels.get(filter_mode, '?')}  (B/H/F)")
         window.GUI.text(f"Surface: {'φ shell' if show_surface_mesh else 'particles'}  (N)")
-        window.GUI.text(f"Clip Y : {'ON' if clip_y else 'OFF'}  Z : {'ON' if clip_z else 'OFF'}")
+        window.GUI.text(
+            f"Clip   : X={'ON' if clip_x else 'off'}(X)  "
+            f"Y={'ON' if clip_y else 'off'}(Y)  "
+            f"Z={'ON' if clip_z else 'off'}(Z)"
+        )
         if clip_z:
-            window.GUI.text("  (Z clip hides crown — press Z)")
+            window.GUI.text("  (Z clip)")
+        if clip_x:
+            window.GUI.text("  (X clip)")
+        if clip_y:
+            window.GUI.text("  (Y clip)")
+        if render_mode == MODE_TEMP:
+            window.GUI.text("  T colors: blue→cyan→yellow→red→white")
+        # Arc vs plate — proves heat tracks torch at the surface (no path Z offset).
+        _arc = getattr(twin, "_last_arc_ijk", None)
+        if _arc is not None:
+            _arc_z = float(_arc[2]) * dx_mm
+            _plate_z = float(twin.nz_solid) * dx_mm
+            window.GUI.text(
+                f"Arc Z  : {_arc_z:.1f} mm  plate top {_plate_z:.1f} mm  "
+                f"(cyan=attach yellow=tip)"
+            )
         window.GUI.text(f"Sim t  : {telem['sim_time_ms']:.2f} ms  step {telem['step']}")
         window.GUI.text(
             f"Pool   : W {telem['pool_width_mm']:.2f} mm  "
@@ -548,17 +728,62 @@ def run(argv: list[str] | None = None) -> None:
             f"T_peak : {telem['peak_temp_C']:.0f} °C  "
             f"u_max {telem['marangoni_vel_ms']:.3f} m/s"
         )
+        cool = telem.get("peak_cooling_rate_Ks", 0.0)
+        window.GUI.text(f"dT/dt  : peak cool {cool:.0f} K/s  (metal)")
+        if not np.isfinite(telem.get("peak_temp_C", 0.0)):
+            window.GUI.text("  WARN: T_peak is NaN — physics blew up; pause / R reset")
+        t_cap_c = twin.T_vapor_cap_K - 273.15
+        if telem.get("vapor_cap_saturated"):
+            n_cap = telem.get("n_cells_at_vapor_cap", 0)
+            window.GUI.text(
+                f"  WARN: vapor-cap saturated ({n_cap} cells @ {t_cap_c:.0f} °C) — "
+                f"peak is clamped, not physical T"
+            )
+        elif np.isfinite(telem["peak_temp_C"]) and telem["peak_temp_C"] > t_cap_c + 50.0:
+            window.GUI.text(
+                f"  WARN: T_peak above vapor cap ({t_cap_c:.0f} °C) — check enthalpy clamp"
+            )
+        u_lu_cap = twin.u_mach_limit_lu * g.dx / g.dt
+        if np.isfinite(telem["marangoni_vel_ms"]) and telem["marangoni_vel_ms"] > 0.95 * u_lu_cap:
+            window.GUI.text(
+                f"  NOTE: u at LBM Mach cap (~{u_lu_cap:.2f} m/s) — forces limited"
+            )
+        if flow_mode == FLOW_STREAMLINES and not streamline_cache:
+            window.GUI.text("  (no streamlines — need liquid + flow; wait for melt)")
+        if render_mode == MODE_VORT and num_cells == 0:
+            window.GUI.text("  (no vorticity — need liquid pool; try B=liquid, clip off)")
+        if render_mode == MODE_VORT and num_cells > 0:
+            window.GUI.text("  Vorticity: purple→yellow = |∇×u| in liquid (auto-scaled)")
         window.GUI.text(
             f"Metal  : {num_cells} rendered  |  "
             f"liquid {telem.get('n_liquid_cells', 0)}"
         )
         bh = telem.get("bead_height_mm", 0.0)
         dep = telem.get("deposited_mass_g", 0.0)
+        exp = telem.get("expected_wire_mass_g", 0.0)
+        mbal = telem.get("mass_balance_ratio", 0.0)
         window.GUI.text(
-            f"Bead   : h {bh:.2f} mm  deposited {dep:.3f} g  "
+            f"Bead   : h {bh:.2f} mm  toe {telem.get('toe_angle_deg', 0):.0f}°  "
+            f"L {telem.get('pool_length_mm', 0):.1f} mm"
+        )
+        window.GUI.text(
+            f"Mass   : dep {dep:.3f} g / wire {exp:.3f} g  "
+            f"bal {mbal:.2f}  ovf {telem.get('deposition_overflow_count', 0)}"
+        )
+        window.GUI.text(
+            f"Phys   : {telem.get('physics_tier', '?')}  "
+            f"p_arc {telem.get('arc_pressure_peak_pa', 0):.0f} Pa  "
+            f"recoil {'ON' if twin.enable_recoil else 'off'}"
+        )
+        if telem.get("lorentz_unconverged_streak", 0) > 0:
+            window.GUI.text(
+                f"  Lorentz streak {telem['lorentz_unconverged_streak']}  "
+                f"(total {telem.get('lorentz_unconverged_count', 0)})"
+            )
+        window.GUI.text(
+            f"Mat    : {telem['material_name']} ({telem['material_status']})  "
             f"tracers {num_tracers}"
         )
-        window.GUI.text(f"Mat    : {telem['material_name']} ({telem['material_status']})")
         if pick_cell is not None:
             pv = sample_cell(twin, *pick_cell)
             window.GUI.text(
@@ -566,16 +791,34 @@ def run(argv: list[str] | None = None) -> None:
                 f"T={pv['T_C']:.0f}°C  f_l={pv['f_l']:.2f}"
             )
         if twin.probe_recorder and twin.probe_recorder.probes:
-            window.GUI.text(f"Probes : {len(twin.probe_recorder.probes)}  (P=torch  I=lookat)")
+            window.GUI.text(f"Probes : {len(twin.probe_recorder.probes)}  (U=torch  I=lookat  P=screenshot)")
         window.GUI.end()
 
         if probe_t_history:
             window.GUI.begin("T(t) probe", 0.01, 0.50, 0.42, 0.22)
             window.GUI.text(f"Probe  : {spark_name}")
-            window.GUI.text(f"T now  : {probe_t_history[-1] - 273.15:.0f} °C")
+            t_now = probe_t_history[-1]
+            if np.isfinite(t_now):
+                window.GUI.text(f"T now  : {t_now - 273.15:.0f} °C")
+            else:
+                window.GUI.text("T now  : NaN")
             window.GUI.text(_sparkline(probe_t_history, probe_spark_min, probe_spark_max))
-            window.GUI.text(f"range  : {probe_spark_min - 273.15:.0f}–{probe_spark_max - 273.15:.0f} °C")
+            if np.isfinite(probe_spark_min) and np.isfinite(probe_spark_max):
+                window.GUI.text(
+                    f"range  : {probe_spark_min - 273.15:.0f}–{probe_spark_max - 273.15:.0f} °C"
+                )
             window.GUI.end()
+
+        if pending_screenshot:
+            path = out_dir / f"frame_{dump_idx:05d}.png"
+            try:
+                # Must run after canvas.scene / GUI, before show (Taichi GGUI).
+                window.save_image(str(path))
+                print(f"[viewer] Screenshot → {path}")
+                dump_idx += 1
+            except Exception as exc:
+                print(f"[viewer] Screenshot failed: {exc}")
+            pending_screenshot = False
 
         window.show()
 
@@ -587,15 +830,16 @@ def _print_controls() -> None:
     print("  V         Cycle flow overlay (off / arrows / streamlines)")
     print("  B / H / F Filter: all / solid / surface")
     print("  N         Toggle φ surface shell (T-colored)")
-    print("  C / Z     Toggle Y / Z cross-section clip")
+    print("  X / Y / Z Mid-plane thermal slice (contour-style cut)")
     print("  T / O     Toggle tracers / torch marker")
     print("  G         Full research VTK bundle → viewer_output/")
-    print("  P         Add probe at torch position")
+    print("            (also auto-exports once when torch path ends)")
+    print("  U         Add probe at torch position")
     print("  I         Pick probe at camera lookat (screen center)")
     print("  R         Reset simulation")
     print("  + / -     More / fewer steps per frame")
-    print("  S         Screenshot → viewer_output/")
-    print("  LMB drag  Orbit camera   ESC  Exit\n")
+    print("  P         Screenshot → viewer_output/")
+    print("  LMB drag  Orbit camera (Z-up)   ESC  Exit\n")
 
 
 def main() -> None:

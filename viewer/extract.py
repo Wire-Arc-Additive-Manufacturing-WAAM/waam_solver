@@ -47,10 +47,34 @@ def _cell_passes_filter(
 
 @ti.func
 def _temperature_color(T: ti.f32, T_solidus: ti.f32, T_liquidus: ti.f32) -> ti.types.vector(3, ti.f32):
+    """Legacy melt-pool colormap (solidus → liquidus+)."""
     temp_ratio = ti.max(0.0, ti.min(1.0,
         (T - T_solidus) / (T_liquidus - T_solidus + 500.0)
     ))
     return ti.Vector([1.0, 0.35 + temp_ratio * 0.65, temp_ratio * 0.45])
+
+
+@ti.func
+def _thermal_field_color(T: ti.f32, T_lo: ti.f32, T_hi: ti.f32) -> ti.types.vector(3, ti.f32):
+    """Full-field heat-transfer colormap: blue → cyan → yellow → red → white.
+
+    Spans ambient → hot so substrate gradients are visible (not flat gray).
+    """
+    u = ti.max(0.0, ti.min(1.0, (T - T_lo) / (T_hi - T_lo + 1e-3)))
+    c = ti.Vector([0.05, 0.08, 0.35])
+    if u < 0.25:
+        t = u / 0.25
+        c = ti.Vector([0.05, 0.08 + 0.55 * t, 0.35 + 0.55 * t])  # blue → cyan
+    elif u < 0.5:
+        t = (u - 0.25) / 0.25
+        c = ti.Vector([0.1 + 0.85 * t, 0.63 + 0.27 * t, 0.9 - 0.7 * t])  # cyan → yellow
+    elif u < 0.75:
+        t = (u - 0.5) / 0.25
+        c = ti.Vector([0.95, 0.9 - 0.55 * t, 0.2 * (1.0 - t)])  # yellow → red
+    else:
+        t = (u - 0.75) / 0.25
+        c = ti.Vector([0.95 + 0.05 * t, 0.35 + 0.55 * t, 0.15 + 0.7 * t])  # red → white-hot
+    return c
 
 
 @ti.kernel
@@ -65,6 +89,7 @@ def extract_melt_pool(
     count: ti.template(),
     dx_mm: ti.f32,
     offset_x_mm: ti.f32,
+    T_amb: ti.f32,
     T_solidus: ti.f32,
     T_liquidus: ti.f32,
     nz_solid: ti.i32,
@@ -74,18 +99,28 @@ def extract_melt_pool(
     filter_mode: ti.i32,
     use_phi: ti.i32,
     max_out: ti.i32,
+    clip_x: ti.i32,
     clip_y: ti.i32,
     clip_z: ti.i32,
+    nx: ti.i32,
     ny: ti.i32,
     nz: ti.i32,
 ):
-    """Extract metal cells; color by T (liquid) or T/T_max (solid bead & HAZ)."""
+    """Extract metal cells colored by continuous temperature (heat-transfer field).
+
+    Mid-plane clips (X/Y/Z) keep a thin slab so the view reads like a 2D
+    thermal contour cut through the plate.
+    """
+    T_hi = T_liquidus + 800.0
     for i, j, k in f_l:
         if flags[i, j, k] == FLAG_GAS:
             continue
-        if clip_y == 1 and j > ny // 2:
+        # Thin mid-plane slab (±1 cell) — contour-style cross-section.
+        if clip_x == 1 and ti.abs(i - nx // 2) > 1:
             continue
-        if clip_z == 1 and k > nz // 2:
+        if clip_y == 1 and ti.abs(j - ny // 2) > 1:
+            continue
+        if clip_z == 1 and ti.abs(k - nz // 2) > 1:
             continue
         if _cell_passes_filter(
             f_l[i, j, k], phi[i, j, k], flags[i, j, k],
@@ -100,29 +135,8 @@ def extract_melt_pool(
                 ti.f32(j) * dx_mm,
                 ti.f32(k) * dx_mm,
             ])
-            Tc = T[i, j, k]
-            T_peak = T_max[i, j, k]
-            # Cold substrate plate (initial nz_solid layers)
-            if k < nz_solid:
-                col_arr[idx] = ti.Vector([0.22, 0.24, 0.30])
-            elif f_l[i, j, k] > 0.05:
-                col_arr[idx] = _temperature_color(Tc, T_solidus, T_liquidus)
-            elif flags[i, j, k] == FLAG_SOLID:
-                # Frozen bead / HAZ: show peak or current temperature
-                T_show = ti.max(Tc, T_peak)
-                if T_show > T_solidus + 80.0:
-                    col_arr[idx] = _temperature_color(T_show, T_solidus, T_liquidus)
-                elif T_show > T_solidus:
-                    col_arr[idx] = ti.Vector([0.85, 0.55, 0.25])
-                elif k >= nz_solid:
-                    # Deposited metal (bead crown), cooled
-                    col_arr[idx] = ti.Vector([0.55, 0.48, 0.40])
-                else:
-                    col_arr[idx] = ti.Vector([0.35, 0.35, 0.40])
-            elif flags[i, j, k] == FLAG_FLUID:
-                col_arr[idx] = ti.Vector([0.45, 0.45, 0.50])
-            else:
-                col_arr[idx] = ti.Vector([0.35, 0.35, 0.40])
+            # Live T everywhere — shows conduction into the cold plate.
+            col_arr[idx] = _thermal_field_color(T[i, j, k], T_amb, T_hi)
 
 
 @ti.kernel
@@ -142,8 +156,10 @@ def extract_haz(
     filter_mode: ti.i32,
     use_phi: ti.i32,
     max_out: ti.i32,
+    clip_x: ti.i32,
     clip_y: ti.i32,
     clip_z: ti.i32,
+    nx: ti.i32,
     ny: ti.i32,
     nz: ti.i32,
 ):
@@ -151,9 +167,11 @@ def extract_haz(
     for i, j, k in T_max:
         if flags[i, j, k] == FLAG_GAS:
             continue
-        if clip_y == 1 and j > ny // 2:
+        if clip_x == 1 and ti.abs(i - nx // 2) > 1:
             continue
-        if clip_z == 1 and k > nz // 2:
+        if clip_y == 1 and ti.abs(j - ny // 2) > 1:
+            continue
+        if clip_z == 1 and ti.abs(k - nz // 2) > 1:
             continue
         if _cell_passes_filter(
             f_l[i, j, k], phi[i, j, k], flags[i, j, k],
@@ -170,9 +188,11 @@ def extract_haz(
             ])
             if f_l[i, j, k] >= 0.01:
                 col_arr[idx] = ti.Vector([1.0, 0.5, 0.0])
-            elif T_max[i, j, k] > 800.0:
+            # HAZ band starts at 800 °C = 1073.15 K (T_max is in Kelvin —
+            # comparing against 800 K = 527 °C overextended the shown HAZ).
+            elif T_max[i, j, k] > 1073.15:
                 intensity = ti.max(0.0, ti.min(1.0,
-                    (T_max[i, j, k] - 800.0) / (T_solidus - 800.0 + 1e-6)
+                    (T_max[i, j, k] - 1073.15) / (T_solidus - 1073.15 + 1e-6)
                 ))
                 col_arr[idx] = ti.Vector([intensity * 0.8, 0.1, 1.0 - intensity * 0.6])
             else:
@@ -201,8 +221,10 @@ def extract_velocity(
     filter_mode: ti.i32,
     use_phi: ti.i32,
     max_out: ti.i32,
+    clip_x: ti.i32,
     clip_y: ti.i32,
     clip_z: ti.i32,
+    nx: ti.i32,
     ny: ti.i32,
     nz: ti.i32,
 ):
@@ -212,9 +234,11 @@ def extract_velocity(
     for i, j, k in f_l:
         if flags[i, j, k] == FLAG_GAS:
             continue
-        if clip_y == 1 and j > ny // 2:
+        if clip_x == 1 and ti.abs(i - nx // 2) > 1:
             continue
-        if clip_z == 1 and k > nz // 2:
+        if clip_y == 1 and ti.abs(j - ny // 2) > 1:
+            continue
+        if clip_z == 1 and ti.abs(k - nz // 2) > 1:
             continue
         if _cell_passes_filter(
             f_l[i, j, k], phi[i, j, k], flags[i, j, k],
@@ -250,9 +274,11 @@ def extract_tracers(
     max_tracers: ti.i32,
     max_out: ti.i32,
     offset_x_mm: ti.f32,
+    clip_x: ti.i32,
     clip_y: ti.i32,
     clip_z: ti.i32,
     dx_m: ti.f32,
+    nx: ti.i32,
     ny: ti.i32,
     nz: ti.i32,
 ):
@@ -262,11 +288,14 @@ def extract_tracers(
         if act > 0:
             pos_mm = pos_in[p] * 1000.0
             pos_mm.x += offset_x_mm
+            if clip_x == 1:
+                if ti.abs(pos_mm.x / (dx_m * 1000.0) - ti.f32(nx // 2)) > 1.5:
+                    continue
             if clip_y == 1:
-                if pos_mm.y / (dx_m * 1000.0) > ny // 2:
+                if ti.abs(pos_mm.y / (dx_m * 1000.0) - ti.f32(ny // 2)) > 1.5:
                     continue
             if clip_z == 1:
-                if pos_mm.z / (dx_m * 1000.0) > nz // 2:
+                if ti.abs(pos_mm.z / (dx_m * 1000.0) - ti.f32(nz // 2)) > 1.5:
                     continue
 
             idx = ti.atomic_add(count[None], 1)
@@ -288,11 +317,28 @@ def extract_torch_marker(
     torch_z_mm: ti.f32,
     max_out: ti.i32,
 ):
-    """Single bright particle at the arc / torch position."""
+    """Yellow contact-tip marker (surface + CTWD)."""
     idx = ti.atomic_add(count[None], 1)
     if idx < max_out:
         pos_arr[idx] = ti.Vector([torch_x_mm, torch_y_mm, torch_z_mm])
         col_arr[idx] = ti.Vector([1.0, 0.95, 0.2])
+
+
+@ti.kernel
+def extract_arc_attach_marker(
+    pos_arr: ti.template(),
+    col_arr: ti.template(),
+    count: ti.template(),
+    x_mm: ti.f32,
+    y_mm: ti.f32,
+    z_mm: ti.f32,
+    max_out: ti.i32,
+):
+    """Cyan marker at the free-surface arc attachment (where heat is injected)."""
+    idx = ti.atomic_add(count[None], 1)
+    if idx < max_out:
+        pos_arr[idx] = ti.Vector([x_mm, y_mm, z_mm])
+        col_arr[idx] = ti.Vector([0.15, 0.95, 1.0])
 
 
 @ti.kernel
@@ -307,29 +353,39 @@ def extract_vorticity(
     dx_mm: ti.f32,
     offset_x_mm: ti.f32,
     vort_ref: ti.f32,
+    vort_floor: ti.f32,
     FLAG_GAS: ti.i32,
     FLAG_FLUID: ti.i32,
     FLAG_SOLID: ti.i32,
     filter_mode: ti.i32,
     use_phi: ti.i32,
     max_out: ti.i32,
+    clip_x: ti.i32,
     clip_y: ti.i32,
     clip_z: ti.i32,
+    nx: ti.i32,
     ny: ti.i32,
     nz: ti.i32,
 ):
+    """Color liquid/mush by |ω|; hide near-zero solid so the pool stands out."""
     inv_ref = 1.0 / (vort_ref + 1e-9)
     for i, j, k in vort:
         if flags[i, j, k] == FLAG_GAS:
             continue
-        if clip_y == 1 and j > ny // 2:
+        if clip_x == 1 and ti.abs(i - nx // 2) > 1:
             continue
-        if clip_z == 1 and k > nz // 2:
+        if clip_y == 1 and ti.abs(j - ny // 2) > 1:
+            continue
+        if clip_z == 1 and ti.abs(k - nz // 2) > 1:
             continue
         if _cell_passes_filter(
             f_l[i, j, k], phi[i, j, k], flags[i, j, k],
             filter_mode, use_phi, FLAG_SOLID, FLAG_GAS,
         ) == 0:
+            continue
+        v = vort[i, j, k]
+        # Skip stagnant cells — otherwise the whole plate is flat dark blue.
+        if v < vort_floor:
             continue
         idx = ti.atomic_add(count[None], 1)
         if idx < max_out:
@@ -338,8 +394,13 @@ def extract_vorticity(
                 ti.f32(j) * dx_mm,
                 ti.f32(k) * dx_mm,
             ])
-            intensity = ti.max(0.0, ti.min(1.0, vort[i, j, k] * inv_ref))
-            col_arr[idx] = ti.Vector([0.2, intensity, 1.0 - intensity])
+            # Log-ish: map [floor, ref] → [0,1] then purple→yellow
+            intensity = ti.max(0.0, ti.min(1.0, ti.log(1.0 + v * inv_ref * 9.0) / ti.log(10.0)))
+            col_arr[idx] = ti.Vector([
+                0.35 + 0.65 * intensity,
+                0.15 + 0.75 * intensity,
+                0.95 - 0.75 * intensity,
+            ])
 
 
 @ti.kernel
@@ -362,8 +423,10 @@ def extract_body_force(
     filter_mode: ti.i32,
     use_phi: ti.i32,
     max_out: ti.i32,
+    clip_x: ti.i32,
     clip_y: ti.i32,
     clip_z: ti.i32,
+    nx: ti.i32,
     ny: ti.i32,
     nz: ti.i32,
 ):
@@ -371,9 +434,11 @@ def extract_body_force(
     for i, j, k in Fx:
         if flags[i, j, k] == FLAG_GAS:
             continue
-        if clip_y == 1 and j > ny // 2:
+        if clip_x == 1 and ti.abs(i - nx // 2) > 1:
             continue
-        if clip_z == 1 and k > nz // 2:
+        if clip_y == 1 and ti.abs(j - ny // 2) > 1:
+            continue
+        if clip_z == 1 and ti.abs(k - nz // 2) > 1:
             continue
         if _cell_passes_filter(
             f_l[i, j, k], phi[i, j, k], flags[i, j, k],
@@ -415,8 +480,10 @@ def extract_flow_arrows(
     filter_mode: ti.i32,
     use_phi: ti.i32,
     max_arrows: ti.i32,
+    clip_x: ti.i32,
     clip_y: ti.i32,
     clip_z: ti.i32,
+    nx: ti.i32,
     ny: ti.i32,
     nz: ti.i32,
 ):
@@ -427,9 +494,11 @@ def extract_flow_arrows(
             continue
         if i % stride != 0 or j % stride != 0 or k % stride != 0:
             continue
-        if clip_y == 1 and j > ny // 2:
+        if clip_x == 1 and ti.abs(i - nx // 2) > 1:
             continue
-        if clip_z == 1 and k > nz // 2:
+        if clip_y == 1 and ti.abs(j - ny // 2) > 1:
+            continue
+        if clip_z == 1 and ti.abs(k - nz // 2) > 1:
             continue
         fl = f_l[i, j, k]
         if fl < 0.08 and not (use_phi == 1 and phi[i, j, k] > 0.15 and phi[i, j, k] < 0.95):
@@ -613,8 +682,10 @@ def extract_force_arrows(
     filter_mode: ti.i32,
     use_phi: ti.i32,
     max_arrows: ti.i32,
+    clip_x: ti.i32,
     clip_y: ti.i32,
     clip_z: ti.i32,
+    nx: ti.i32,
     ny: ti.i32,
     nz: ti.i32,
 ):
@@ -624,9 +695,11 @@ def extract_force_arrows(
             continue
         if i % stride != 0 or j % stride != 0 or k % stride != 0:
             continue
-        if clip_y == 1 and j > ny // 2:
+        if clip_x == 1 and ti.abs(i - nx // 2) > 1:
             continue
-        if clip_z == 1 and k > nz // 2:
+        if clip_y == 1 and ti.abs(j - ny // 2) > 1:
+            continue
+        if clip_z == 1 and ti.abs(k - nz // 2) > 1:
             continue
         if f_l[i, j, k] < 0.08:
             continue
@@ -672,8 +745,10 @@ def extract_surface_points(
     T_liquidus: ti.f32,
     FLAG_GAS: ti.i32,
     max_out: ti.i32,
+    clip_x: ti.i32,
     clip_y: ti.i32,
     clip_z: ti.i32,
+    nx: ti.i32,
     ny: ti.i32,
     nz: ti.i32,
 ):
@@ -681,9 +756,11 @@ def extract_surface_points(
     for i, j, k in phi:
         if flags[i, j, k] == FLAG_GAS:
             continue
-        if clip_y == 1 and j > ny // 2:
+        if clip_x == 1 and ti.abs(i - nx // 2) > 1:
             continue
-        if clip_z == 1 and k > nz // 2:
+        if clip_y == 1 and ti.abs(j - ny // 2) > 1:
+            continue
+        if clip_z == 1 and ti.abs(k - nz // 2) > 1:
             continue
         if phi[i, j, k] < 0.35 or phi[i, j, k] > 0.65:
             continue

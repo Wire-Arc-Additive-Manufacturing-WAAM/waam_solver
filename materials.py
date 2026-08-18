@@ -42,6 +42,7 @@ class MaterialProps:
     sulphur_ppm: float = 30.0
     status: str = "placeholder"
     source: str = ""
+    notes: str = ""
     high_sulphur: bool = False
     tables: MaterialTables = field(default_factory=MaterialTables)
 
@@ -58,7 +59,14 @@ class MaterialProps:
         return interp_linear(T, self.tables.dgamma_dT, self.dgamma_dT)
 
 
-def _props_from_constants(name: str, status: str, source: str, c: dict) -> MaterialProps:
+def _props_from_constants(
+    name: str,
+    status: str,
+    source: str,
+    c: dict,
+    notes: str = "",
+) -> MaterialProps:
+
     rho = float(c["rho"])
     cp = float(c["cp"])
     k = float(c["k"])
@@ -79,10 +87,11 @@ def _props_from_constants(name: str, status: str, source: str, c: dict) -> Mater
         beta_T=float(c.get("beta_T", 1.2e-4)),
         status=status,
         source=source or "",
+        notes=notes or "",
     )
 
 
-def _surface_from_yaml(data: dict) -> tuple[float, float, float, float]:
+def _surface_from_yaml(data: dict) -> tuple[float, float, float, float, str]:
     surface = data.get("surface", {}) or {}
     electrical = data.get("electrical", {}) or {}
     surfactant = data.get("surfactant", {}) or {}
@@ -90,7 +99,8 @@ def _surface_from_yaml(data: dict) -> tuple[float, float, float, float]:
     rho_e = float(electrical.get("rho_e_ohm_m", 1.5e-7))
     eta_stick = float(electrical.get("eta_stick", 0.85))
     sulphur_ppm = float(surfactant.get("sulphur_ppm", 30.0))
-    return theta, rho_e, eta_stick, sulphur_ppm
+    model = str(surfactant.get("model", "heiple"))
+    return theta, rho_e, eta_stick, sulphur_ppm, model
 
 
 def validate_material_data(data: dict, path: pathlib.Path | None = None) -> None:
@@ -136,18 +146,17 @@ def _load_yaml_file(path: pathlib.Path) -> MaterialProps:
         data.get("status", "placeholder"),
         data.get("source", ""),
         data["constants"],
+        notes=str(data.get("notes", "") or ""),
     )
-    theta, rho_e, eta_stick, sulphur_ppm = _surface_from_yaml(data)
+    theta, rho_e, eta_stick, sulphur_ppm, surf_model = _surface_from_yaml(data)
     props.contact_angle_deg = theta
     props.rho_e_ohm_m = rho_e
     props.eta_stick = eta_stick
     props.sulphur_ppm = sulphur_ppm
     props.tables = tables_from_yaml(data.get("tables"))
-    from .physics.surfactant import effective_dgamma_dT, scale_dgamma_table
+    from .physics.surfactant import apply_surfactant_model
 
-    props.dgamma_dT = effective_dgamma_dT(props.dgamma_dT, sulphur_ppm)
-    if props.tables.dgamma_dT:
-        props.tables.dgamma_dT = scale_dgamma_table(props.tables.dgamma_dT, sulphur_ppm)
+    apply_surfactant_model(props, surf_model)
     return props
 
 
@@ -224,9 +233,15 @@ def load_material(name: str, high_sulphur: bool = False) -> MaterialProps:
         props = _LEGACY_LIBRARY[key_match]
 
     if high_sulphur:
-        props = MaterialProps(
-            **{**props.__dict__, "dgamma_dT": abs(props.dgamma_dT), "high_sulphur": True}
-        )
+        props.sulphur_ppm = max(float(props.sulphur_ppm), 150.0)
+        props.high_sulphur = True
+        from .physics.surfactant import apply_sahoo_to_material_props
+
+        # Re-evaluate chemistry at elevated S: prefer Sahoo if a dense table is present.
+        if len(props.tables.dgamma_dT) >= 10:
+            apply_sahoo_to_material_props(props)
+        else:
+            props.dgamma_dT = abs(float(props.dgamma_dT))
 
     if props.status == "placeholder":
         print(

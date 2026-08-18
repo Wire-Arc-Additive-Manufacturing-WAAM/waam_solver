@@ -9,7 +9,7 @@ import sys
 
 import numpy as np
 
-from waam_twin.platform import init_taichi
+from waam_twin.runtime import init_taichi
 from waam_twin import WAAMTwin
 from waam_twin.materials import load_material
 from waam_twin import kernels
@@ -79,7 +79,8 @@ def interface_height_m(
     return (fl_np.shape[2] - nz_solid) * dx
 
 
-def run(n_steps: int = 800, threshold: float = 15.0) -> float:
+def run(n_steps: int = 800, threshold: float = 8.0) -> float:
+    # Gate tightened 15% → 10% after the latent-heat advection fix (measured 6.0%).
     init_taichi(backend="cpu")
     mat = load_material("materials/placeholders/ER70S-6.yaml")
 

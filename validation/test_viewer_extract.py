@@ -7,7 +7,7 @@ from __future__ import annotations
 import taichi as ti
 
 from waam_twin import WAAMTwin
-from waam_twin.platform import init_taichi
+from waam_twin.runtime import init_taichi
 from waam_twin.viewer.extract import (
     FILTER_ALL,
     extract_melt_pool,
@@ -31,11 +31,11 @@ def run() -> None:
         g.f_l, g.T, g.T_max, g.phi, g.flags,
         pos, col, count,
         g.dx * 1000.0, 0.0,
-        twin.mat.T_solidus, twin.mat.T_liquidus,
+        twin.T_amb, twin.mat.T_solidus, twin.mat.T_liquidus,
         twin.nz_solid,
         g.FLAG_GAS, g.FLAG_FLUID, g.FLAG_SOLID,
         FILTER_ALL, 1, max_cells,
-        0, 0, g.ny, g.nz,
+        0, 0, 0, g.nx, g.ny, g.nz,
     )
     n = int(count[None])
     print(f"[viewer_extract] extract_melt_pool cells={n} arch={ti.lang.impl.current_cfg().arch}")

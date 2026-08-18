@@ -1,5 +1,5 @@
 """
-platform.py — Backend detection, presets, and grid sizing (waam_twin v2)
+runtime.py — Backend detection, presets, and grid sizing (waam_twin v2)
 """
 
 from __future__ import annotations
@@ -33,12 +33,23 @@ class PlatformProfile:
 
 @dataclass
 class PresetConfig:
+    """Hardware / cost profile — not the weld coupon geometry.
+
+    ``vram_budget_mb`` and ``max_cells`` limit *cell count*, which is the
+    practical compute-intensity knob (timestep work ∝ N_cells × physics_tier).
+    Target for dx coarsening is that cell/memory budget — **not** viewer FPS.
+    """
+
     name: str
     vram_budget_mb: int
-    domain_mm: tuple[float, float, float]
     target_dx_mm: float
     max_tracers: int
     use_srt: bool
+    max_cells: int | None = None
+
+
+# Demo-only fallback when ``from_preset`` is called with no domain and no job.
+DEMO_DEFAULT_DOMAIN_MM: tuple[float, float, float] = (80.0, 40.0, 25.0)
 
 
 def _load_yaml(path: pathlib.Path) -> dict[str, Any]:
@@ -58,17 +69,39 @@ def load_presets() -> dict[str, PresetConfig]:
     raw = _load_yaml(_PRESETS_PATH)
     out: dict[str, PresetConfig] = {}
     for name, cfg in raw.items():
-        domain = cfg.get("domain_mm", [80, 40, 25])
+        if "domain_mm" in cfg:
+            from . import logging_util as log
+            log.warning(
+                f"[presets] '{name}.domain_mm' is ignored — geometry belongs in the "
+                f"job YAML (simulation.domain_mm / plate.size_mm)."
+            )
+        max_cells = cfg.get("max_cells")
         out[name] = PresetConfig(
             name=name,
             vram_budget_mb=int(cfg.get("vram_budget_mb", 2048)),
-            domain_mm=(float(domain[0]), float(domain[1]), float(domain[2])),
             target_dx_mm=float(cfg.get("target_dx_mm", 0.3)),
             max_tracers=int(cfg.get("max_tracers", 20000)),
             use_srt=bool(cfg.get("use_srt", True)),
+            max_cells=int(max_cells) if max_cells is not None else None,
         )
     return out
 
+
+def resolve_grid_budget_mb(preset: PresetConfig) -> int:
+    """Effective memory cap for ``auto_grid``.
+
+    Precedence:
+      1. ``WAAM_VRAM_MB`` — explicit override (use to raise/lower the cap)
+      2. preset ``vram_budget_mb`` — hardware-profile default
+
+    Detected device VRAM is **not** used as the budget: filling an 8 GB card
+    would make ``minimal`` as heavy as ``high``. Empty device memory means the
+    profile's compute cap is doing its job.
+    """
+    override = os.environ.get("WAAM_VRAM_MB")
+    if override:
+        return max(64, int(override))
+    return int(preset.vram_budget_mb)
 
 def resolve_preset(name: str | None = None) -> PresetConfig:
     env = os.environ.get("WAAM_PRESET", "standard")
@@ -127,15 +160,35 @@ def _runtime_is_live() -> bool:
 
 
 def init_taichi(backend: str | None = None) -> PlatformProfile:
-    """Initialize Taichi once: CUDA → Vulkan → CPU."""
+    """Initialize Taichi once: CUDA → Vulkan → CPU.
+
+    Backend selection priority:
+      1. ``WAAM_FORCE_BACKEND`` — sticky override (survives tests that mutate
+         ``WAAM_BACKEND``, e.g. backend_smoke)
+      2. ``WAAM_BACKEND`` — overrides hardcoded ``backend="cpu"`` in tests
+      3. ``backend`` argument / ``auto``
+    """
     global _taichi_initialized, _profile
     if _taichi_initialized and not _runtime_is_live():
         _taichi_initialized = False
         _profile = None
-    if _taichi_initialized and _profile is not None:
-        return _profile
 
-    requested = (backend or os.environ.get("WAAM_BACKEND", "auto")).lower()
+    force = (os.environ.get("WAAM_FORCE_BACKEND") or "").strip().lower()
+    env_backend = (os.environ.get("WAAM_BACKEND") or "").strip().lower()
+    if force in ("cpu", "cuda", "vulkan", "auto"):
+        requested = force
+    elif env_backend in ("cpu", "cuda", "vulkan", "auto"):
+        requested = env_backend
+    else:
+        requested = (backend or "auto").lower()
+
+    # Re-init if caller/env asks for a different device than the live runtime.
+    if _taichi_initialized and _profile is not None:
+        if requested != "auto" and _profile.backend != requested:
+            reset_taichi()
+        else:
+            return _profile
+
     arch = None
     backend_used = "cpu"
 
@@ -230,12 +283,21 @@ def auto_grid(
     target_dx_mm: float,
     vram_budget_mb: int,
     max_tracers: int = 20000,
+    max_cells: int | None = None,
+    *,
+    log_coarsen: bool = True,
 ) -> tuple[int, int, int, float]:
     """
-    Pick (nx, ny, nz, dx) to fit domain and VRAM budget.
-    dx may be coarsened if the requested resolution does not fit.
+    Pick (nx, ny, nz, dx) for a fixed physical domain.
+
+    Domain size is never shrunk. If the requested ``target_dx_mm`` needs more
+    memory or cells than the hardware profile allows, ``dx`` is coarsened
+    until the grid fits (or a MemoryError is raised).
     """
+    from . import logging_util as log
+
     dx_m = target_dx_mm / 1000.0
+    dx_req_mm = target_dx_mm
     lx, ly, lz = (d / 1000.0 for d in domain_mm)
 
     nx = max(8, int(lx / dx_m))
@@ -243,18 +305,42 @@ def auto_grid(
     nz = max(8, int(lz / dx_m))
 
     budget = float(vram_budget_mb) * 0.85  # headroom for Taichi runtime
+    cell_cap = int(max_cells) if max_cells is not None else None
 
-    while estimate_grid_vram_mb(nx, ny, nz, max_tracers) > budget and dx_m < 0.002:
+    def _over_budget() -> bool:
+        if estimate_grid_vram_mb(nx, ny, nz, max_tracers) > budget:
+            return True
+        if cell_cap is not None and nx * ny * nz > cell_cap:
+            return True
+        return False
+
+    while _over_budget() and dx_m < 0.002:
         dx_m *= 1.15
         nx = max(8, int(lx / dx_m))
         ny = max(8, int(ly / dx_m))
         nz = max(8, int(lz / dx_m))
 
     est = estimate_grid_vram_mb(nx, ny, nz, max_tracers)
-    if est > budget:
+    n_cells = nx * ny * nz
+    if est > budget or (cell_cap is not None and n_cells > cell_cap):
         raise MemoryError(
-            f"Grid {nx}×{ny}×{nz} needs ~{est:.0f} MB but budget is {vram_budget_mb} MB. "
-            f"Use WAAM_PRESET=minimal or set WAAM_VRAM_MB."
+            f"Grid {nx}×{ny}×{nz} (~{est:.0f} MB, {n_cells} cells) exceeds hardware "
+            f"budget {vram_budget_mb} MB"
+            + (f" / max_cells={cell_cap}" if cell_cap is not None else "")
+            + ". Raise WAAM_VRAM_MB, use a larger hardware profile, or shrink "
+            "simulation.domain_mm in the job."
+        )
+
+    dx_mm = dx_m * 1000.0
+    if log_coarsen and dx_mm > dx_req_mm * 1.02:
+        reason = []
+        if cell_cap is not None:
+            reason.append(f"max_cells={cell_cap}")
+        reason.append(f"vram_budget≈{vram_budget_mb} MB")
+        log.info(
+            f"[auto_grid] Kept domain {domain_mm[0]:.0f}×{domain_mm[1]:.0f}×{domain_mm[2]:.0f} mm; "
+            f"coarsened dx {dx_req_mm:.3f}→{dx_mm:.3f} mm to fit ({', '.join(reason)}). "
+            f"Grid {nx}×{ny}×{nz} (~{est:.0f} MB). Target is cell/VRAM budget, not FPS."
         )
 
     return nx, ny, nz, dx_m
@@ -265,5 +351,5 @@ def check_vram_budget(nx: int, ny: int, nz: int, max_tracers: int, budget_mb: in
     if est > budget_mb:
         raise MemoryError(
             f"Estimated VRAM {est:.1f} MB exceeds budget {budget_mb} MB. "
-            f"Try WAAMTwin.from_preset('minimal') or a coarser dx."
+            f"Try a coarser dx, WAAM_VRAM_MB, or a smaller simulation.domain_mm."
         )

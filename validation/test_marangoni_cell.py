@@ -8,7 +8,7 @@ import sys
 
 import numpy as np
 
-from waam_twin.platform import init_taichi
+from waam_twin.runtime import init_taichi
 from waam_twin import WAAMTwin
 from waam_twin.physics import forces
 
@@ -21,6 +21,7 @@ def run() -> float:
 
     T_np = g.T.to_numpy()
     phi_np = g.phi.to_numpy()
+    fl_np = g.f_l.to_numpy()
     flags_np = g.flags.to_numpy()
     nz_s = twin.nz_solid
     j = g.ny // 2
@@ -28,17 +29,21 @@ def run() -> float:
         for k in range(g.nz):
             if k < nz_s - 1:
                 phi_np[i, j, k] = 1.0
+                fl_np[i, j, k] = 0.0
                 flags_np[i, j, k] = g.FLAG_SOLID
             elif k == nz_s - 1:
                 phi_np[i, j, k] = 0.5
+                fl_np[i, j, k] = 1.0
                 flags_np[i, j, k] = g.FLAG_IFACE
                 T_np[i, j, k] = 300.0 + 200.0 * (i / max(g.nx - 1, 1))
             else:
                 phi_np[i, j, k] = 0.0
+                fl_np[i, j, k] = 0.0
                 flags_np[i, j, k] = g.FLAG_GAS
 
     g.T.from_numpy(T_np)
     g.phi.from_numpy(phi_np)
+    g.f_l.from_numpy(fl_np)
     g.flags.from_numpy(flags_np)
 
     forces.clear_forces(g.Fx, g.Fy, g.Fz)
